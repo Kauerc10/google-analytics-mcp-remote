@@ -15,9 +15,20 @@
 """HTTP server configuration for Google Analytics MCP."""
 
 import argparse
+import contextlib
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
+
+from mcp.server.lowlevel import Server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
+from starlette.routing import Mount, Route
+from starlette.types import Receive, Scope, Send
+
+import analytics_mcp.coordinator as coordinator
 
 
 @dataclass(frozen=True)
@@ -69,3 +80,48 @@ def parse_http_config(
     parser.add_argument("--path", type=_path, default="/mcp")
     args = parser.parse_args(argv)
     return HttpServerConfig(args.host, args.port, args.path)
+
+
+def create_http_app(
+    mcp_server: Server = coordinator.app,
+    path: str = "/mcp",
+) -> Starlette:
+    """Create the ASGI application for Streamable HTTP."""
+    normalized_path = _path(path)
+    session_manager = StreamableHTTPSessionManager(
+        app=mcp_server,
+        event_store=None,
+        json_response=True,
+        stateless=True,
+    )
+
+    async def handle_mcp(
+        scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        await session_manager.handle_request(scope, receive, send)
+
+    async def healthz(_: Request) -> PlainTextResponse:
+        return PlainTextResponse("ok")
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_: Starlette) -> AsyncIterator[None]:
+        async with session_manager.run():
+            yield
+
+    return Starlette(
+        routes=[
+            Route("/healthz", healthz, methods=["GET"]),
+            Mount(normalized_path, app=handle_mcp),
+        ],
+        lifespan=lifespan,
+    )
+
+
+def run_http_server(argv: Sequence[str] | None = None) -> None:
+    """Run the Streamable HTTP server with Uvicorn."""
+    config = parse_http_config(argv)
+    app = create_http_app(path=config.path)
+
+    import uvicorn
+
+    uvicorn.run(app, host=config.host, port=config.port)
