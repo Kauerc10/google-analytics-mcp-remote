@@ -25,7 +25,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
-from starlette.routing import Mount, Route
+from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
 import analytics_mcp.coordinator as coordinator
@@ -40,6 +40,21 @@ class HttpServerConfig:
     path: str
 
 
+class _McpEndpoint:
+    """ASGI endpoint that forwards requests to the MCP transport."""
+
+    def __init__(self, session_manager: StreamableHTTPSessionManager):
+        self._session_manager = session_manager
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        await self._session_manager.handle_request(scope, receive, send)
+
+
 def _port(value: str) -> int:
     """Parse and validate a TCP port."""
     try:
@@ -47,9 +62,7 @@ def _port(value: str) -> int:
     except ValueError as exc:
         raise argparse.ArgumentTypeError("port must be an integer") from exc
     if not 1 <= port <= 65535:
-        raise argparse.ArgumentTypeError(
-            "port must be between 1 and 65535"
-        )
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
     return port
 
 
@@ -95,11 +108,6 @@ def create_http_app(
         stateless=True,
     )
 
-    async def handle_mcp(
-        scope: Scope, receive: Receive, send: Send
-    ) -> None:
-        await session_manager.handle_request(scope, receive, send)
-
     async def healthz(_: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
 
@@ -111,7 +119,11 @@ def create_http_app(
     return Starlette(
         routes=[
             Route("/healthz", healthz, methods=["GET"]),
-            Mount(normalized_path, app=handle_mcp),
+            Route(
+                normalized_path,
+                endpoint=_McpEndpoint(session_manager),
+                methods=["GET", "POST", "DELETE"],
+            ),
         ],
         lifespan=lifespan,
     )
