@@ -100,6 +100,18 @@ class HttpServerConfigTest(unittest.TestCase):
             http_server.parse_http_config([], {"PORT": "not-a-port"})
 
 
+class HttpTransportSecurityTest(unittest.TestCase):
+    def test_loopback_bind_enables_dns_rebinding_protection(self):
+        settings = http_server._transport_security("127.0.0.1")
+        self.assertTrue(settings.enable_dns_rebinding_protection)
+        self.assertIn("127.0.0.1:*", settings.allowed_hosts)
+        self.assertIn("localhost:*", settings.allowed_hosts)
+
+    def test_remote_bind_defers_host_validation_to_deployment(self):
+        settings = http_server._transport_security("0.0.0.0")
+        self.assertFalse(settings.enable_dns_rebinding_protection)
+
+
 class HttpApplicationTest(unittest.TestCase):
     def test_healthz_does_not_resolve_google_credentials(self):
         app = http_server.create_http_app()
@@ -172,11 +184,10 @@ class StreamableHttpProtocolTest(unittest.IsolatedAsyncioTestCase):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(
                 transport=transport,
-                base_url="http://testserver",
-                follow_redirects=True,
+                base_url="http://localhost:8000",
             ) as http_client:
                 async with streamable_http_client(
-                    "http://testserver/mcp",
+                    "http://localhost:8000/mcp",
                     http_client=http_client,
                 ) as (read_stream, write_stream, get_session_id):
                     async with ClientSession(
@@ -209,11 +220,10 @@ class GoogleAnalyticsToolDiscoveryTest(unittest.IsolatedAsyncioTestCase):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(
                 transport=transport,
-                base_url="http://testserver",
-                follow_redirects=True,
+                base_url="http://localhost:8000",
             ) as http_client:
                 async with streamable_http_client(
-                    "http://testserver/mcp",
+                    "http://localhost:8000/mcp",
                     http_client=http_client,
                 ) as (read_stream, write_stream, _):
                     async with ClientSession(
