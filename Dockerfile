@@ -9,7 +9,8 @@ WORKDIR /app
 RUN addgroup --system analytics-mcp \
     && adduser --system --ingroup analytics-mcp analytics-mcp
 
-COPY . .
+COPY pyproject.toml README.md LICENSE ./
+COPY analytics_mcp ./analytics_mcp
 RUN pip install --no-cache-dir .
 
 USER analytics-mcp
