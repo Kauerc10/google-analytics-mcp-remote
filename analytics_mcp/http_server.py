@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
@@ -29,6 +30,8 @@ from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
 import analytics_mcp.coordinator as coordinator
+
+_LOCAL_BIND_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 @dataclass(frozen=True)
@@ -74,6 +77,31 @@ def _path(value: str) -> str:
     return normalized or "/"
 
 
+def _transport_security(host: str) -> TransportSecuritySettings:
+    """Return transport security settings for the selected bind host."""
+    if host in _LOCAL_BIND_HOSTS:
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[
+                "127.0.0.1",
+                "127.0.0.1:*",
+                "localhost",
+                "localhost:*",
+                "[::1]",
+                "[::1]:*",
+            ],
+            allowed_origins=[
+                "http://127.0.0.1",
+                "http://127.0.0.1:*",
+                "http://localhost",
+                "http://localhost:*",
+                "http://[::1]",
+                "http://[::1]:*",
+            ],
+        )
+    return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
 def parse_http_config(
     argv: Sequence[str] | None = None,
     environ: Mapping[str, str] | None = None,
@@ -98,6 +126,7 @@ def parse_http_config(
 def create_http_app(
     mcp_server: Server = coordinator.app,
     path: str = "/mcp",
+    host: str = "127.0.0.1",
 ) -> Starlette:
     """Create the ASGI application for Streamable HTTP."""
     normalized_path = _path(path)
@@ -106,6 +135,7 @@ def create_http_app(
         event_store=None,
         json_response=True,
         stateless=True,
+        security_settings=_transport_security(host),
     )
 
     async def healthz(_: Request) -> PlainTextResponse:
@@ -132,7 +162,7 @@ def create_http_app(
 def run_http_server(argv: Sequence[str] | None = None) -> None:
     """Run the Streamable HTTP server with Uvicorn."""
     config = parse_http_config(argv)
-    app = create_http_app(path=config.path)
+    app = create_http_app(path=config.path, host=config.host)
 
     import uvicorn
 
