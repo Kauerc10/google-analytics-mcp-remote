@@ -13,6 +13,8 @@ represents one Google identity.
 Enable the Google Analytics Admin API and Google Analytics Data API in the
 Google Cloud project used by the runtime identity. That identity also needs
 Viewer access to the Google Analytics accounts or properties it will query.
+Google Cloud IAM permissions and Google Analytics property permissions are
+separate controls.
 
 The required Analytics scope remains:
 
@@ -58,6 +60,12 @@ The HTTP process uses the same ADC configuration as the stdio server. For
 local credentials, follow the main README instructions before starting the
 HTTP entrypoint.
 
+Loopback binds enable Host and Origin validation for DNS-rebinding protection.
+When the server binds to a non-loopback interface such as `0.0.0.0`, network
+access and host validation must be enforced by the deployment layer, such as
+Cloud Run, an authenticated reverse proxy, or private networking. Do not expose
+the raw listener directly to the public Internet.
+
 ## Run with Docker
 
 Build the image:
@@ -66,10 +74,13 @@ Build the image:
 docker build -t analytics-mcp .
 ```
 
-For local development, an existing ADC file can be mounted read-only:
+For local development on Unix-like systems, an existing ADC file can be
+mounted read-only while running the container with the current user's UID and
+GID so a restrictive local credential file remains readable:
 
 ```shell
 docker run --rm -p 8080:8080 \
+  --user "$(id -u):$(id -g)" \
   -e GOOGLE_APPLICATION_CREDENTIALS=/credentials/adc.json \
   -v "$HOME/.config/gcloud/application_default_credentials.json:/credentials/adc.json:ro" \
   analytics-mcp
@@ -79,13 +90,14 @@ Mounting a credential file is a local-development option. On managed
 platforms, prefer a workload or service identity instead of downloading and
 shipping long-lived service-account keys.
 
-The container listens on `0.0.0.0` and honors the platform-provided `PORT`
-environment variable.
+The image runs as a non-root user by default. It listens on `0.0.0.0` and
+honors the platform-provided `PORT` environment variable.
 
 ## Deploy to Cloud Run
 
-Cloud Run can run Streamable HTTP MCP servers and provides ADC through the
-service identity attached to the container.
+Cloud Run supports remote MCP servers over Streamable HTTP and provides ADC
+through the service identity attached to the container. Source deployments use
+Cloud Build and Artifact Registry to produce and store the container image.
 
 Choose a project, region, service name, and dedicated service account:
 
@@ -102,19 +114,23 @@ Enable the required services:
 gcloud services enable \
   analyticsadmin.googleapis.com \
   analyticsdata.googleapis.com \
+  artifactregistry.googleapis.com \
+  cloudbuild.googleapis.com \
   run.googleapis.com \
-  cloudbuild.googleapis.com
+  --project "${PROJECT_ID}"
 ```
 
 Create the runtime service account:
 
 ```shell
 gcloud iam service-accounts create analytics-mcp \
-  --display-name="Google Analytics MCP"
+  --display-name="Google Analytics MCP" \
+  --project "${PROJECT_ID}"
 ```
 
 Add `SERVICE_ACCOUNT` as a Viewer to the Google Analytics accounts or
-properties that this deployment should be able to query.
+properties that this deployment should be able to query. This Analytics access
+is required in addition to any Google Cloud IAM roles.
 
 Deploy the service and require authenticated invocation:
 
@@ -122,6 +138,7 @@ Deploy the service and require authenticated invocation:
 gcloud run deploy "${SERVICE_NAME}" \
   --source . \
   --region "${REGION}" \
+  --project "${PROJECT_ID}" \
   --service-account "${SERVICE_ACCOUNT}" \
   --no-allow-unauthenticated
 ```
@@ -140,10 +157,24 @@ Grant the calling identity the Cloud Run Invoker role according to your
 organization's IAM policy, then configure the client or an authentication
 proxy to send the required ID token.
 
-Not every MCP client can mint or attach a Google Cloud ID token directly. If a
-client cannot satisfy Cloud Run IAM, place an authentication layer in front of
-the MCP server that the client supports. End-user MCP OAuth is intentionally
-outside the scope of this transport change.
+For local testing, Cloud Run also provides an authenticated proxy:
+
+```shell
+gcloud run services proxy "${SERVICE_NAME}" \
+  --region "${REGION}" \
+  --project "${PROJECT_ID}"
+```
+
+The local MCP endpoint is then available through the proxy at:
+
+```text
+http://127.0.0.1:8080/mcp
+```
+
+Not every hosted MCP client can mint or attach a Google Cloud ID token
+directly. If a client cannot satisfy Cloud Run IAM, place an authentication
+layer in front of the MCP server that the client supports. End-user MCP OAuth
+is intentionally outside the scope of this transport change.
 
 See the Google Cloud documentation for
 [authenticating service-to-service requests](https://cloud.google.com/run/docs/authenticating/service-to-service)
@@ -169,7 +200,10 @@ session database, or an event store.
 - The server is client-neutral and single-identity.
 - Google Analytics access remains read-only through ADC.
 - End-user Google OAuth is not implemented by this transport.
-- The deployment layer controls who may reach `/mcp`.
+- Loopback listeners validate Host and Origin headers against local addresses.
+- Non-loopback listeners rely on the authenticated deployment or proxy layer
+  for network access and host validation.
+- Wildcard CORS is not enabled by the application.
 - Do not expose Analytics read access unauthenticated to the public Internet.
 - Do not copy credential files or service-account keys into the container
   image.
@@ -188,6 +222,12 @@ identity to the managed runtime.
 The deployment layer rejected the client before the MCP server handled the
 request. Check Cloud Run Invoker permissions, the ID token, its audience, or
 the authentication proxy in front of the service.
+
+### HTTP 403 on a local browser-origin request
+
+The loopback transport rejects Origins outside its local allowlist. Use a
+supported local Origin or connect with a server-to-server MCP client. The
+application does not enable permissive wildcard CORS.
 
 ### HTTP 404
 
