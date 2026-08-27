@@ -112,6 +112,28 @@ class HttpApplicationTest(unittest.TestCase):
         self.assertEqual(response.text, "ok")
         credentials.assert_not_called()
 
+    def test_default_mcp_path_does_not_redirect(self):
+        async def fake_handle_request(_manager, scope, receive, send):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 204,
+                    "headers": [],
+                }
+            )
+            await send({"type": "http.response.body", "body": b""})
+
+        with mock.patch.object(
+            http_server.StreamableHTTPSessionManager,
+            "handle_request",
+            new=fake_handle_request,
+        ):
+            app = http_server.create_http_app()
+            with TestClient(app, follow_redirects=False) as client:
+                response = client.post("/mcp")
+
+        self.assertEqual(response.status_code, 204)
+
     def test_custom_mcp_path_replaces_default_path(self):
         app = http_server.create_http_app(path="/analytics")
         with TestClient(app, follow_redirects=False) as client:
