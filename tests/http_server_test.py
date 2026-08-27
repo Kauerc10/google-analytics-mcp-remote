@@ -14,6 +14,7 @@
 
 import contextlib
 import unittest
+from importlib import metadata
 from typing import Any
 from unittest import mock
 
@@ -177,3 +178,48 @@ class StreamableHttpProtocolTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.isError)
         self.assertEqual(result.content[0].text, "123456")
         self.assertIsNone(get_session_id())
+
+
+class GoogleAnalyticsToolDiscoveryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_http_lists_existing_google_analytics_tools(self):
+        app = http_server.create_http_app()
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+                follow_redirects=True,
+            ) as http_client:
+                async with streamable_http_client(
+                    "http://testserver/mcp",
+                    http_client=http_client,
+                ) as (read_stream, write_stream, _):
+                    async with ClientSession(
+                        read_stream, write_stream
+                    ) as session:
+                        await session.initialize()
+                        tools = await session.list_tools()
+
+        names = {tool.name for tool in tools.tools}
+        self.assertIn("get_account_summaries", names)
+        self.assertIn("run_report", names)
+        self.assertIn("run_realtime_report", names)
+        self.assertIn("run_funnel_report", names)
+        self.assertIn("run_conversions_report", names)
+
+
+class ConsoleScriptCompatibilityTest(unittest.TestCase):
+    def test_stdio_and_http_scripts_are_registered(self):
+        expected = {
+            "analytics-mcp": "analytics_mcp.server:run_server",
+            "google-analytics-mcp": "analytics_mcp.server:run_server",
+            "analytics-mcp-http": (
+                "analytics_mcp.http_server:run_http_server"
+            ),
+        }
+        scripts = {
+            entry.name: entry.value
+            for entry in metadata.entry_points(group="console_scripts")
+            if entry.name in expected
+        }
+        self.assertEqual(scripts, expected)
