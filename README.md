@@ -165,6 +165,20 @@ Credentials saved to file: [PATH_TO_CREDENTIALS_JSON]
       -- pipx run analytics-mcp
     ```
 
+### Run as a remote MCP server
+
+The same tools can also be exposed over stateless MCP Streamable HTTP:
+
+```shell
+analytics-mcp-http
+```
+
+The default endpoint is `http://127.0.0.1:8000/mcp`. Remote deployments
+continue to use Application Default Credentials and must be protected by an
+authenticated deployment or proxy layer. See
+[Remote server deployment](docs/remote-server.md) for Docker, Cloud Run, and
+security guidance.
+
 ## Try it out 🥼
 
 Launch Gemini Code Assist or Gemini CLI and type `/mcp`. You should see
