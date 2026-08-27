@@ -12,9 +12,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import unittest
+from typing import Any
+from unittest import mock
+
+import httpx
+from mcp import types as mcp_types
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from mcp.server.lowlevel import Server
+from starlette.testclient import TestClient
 
 from analytics_mcp import http_server
+
+
+def create_test_mcp_server() -> Server:
+    """Creates an isolated server for transport-level tests."""
+    server = Server("test-analytics-mcp")
+
+    @server.list_tools()
+    async def list_tools() -> list[mcp_types.Tool]:
+        return [
+            mcp_types.Tool(
+                name="echo_property",
+                description="Echo a property ID.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "property_id": {"type": "string"},
+                    },
+                    "required": ["property_id"],
+                },
+            )
+        ]
+
+    @server.call_tool()
+    async def call_tool(
+        name: str, arguments: dict[str, Any]
+    ) -> list[mcp_types.ContentBlock]:
+        if name != "echo_property":
+            raise ValueError(f"Unknown test tool: {name}")
+        return [
+            mcp_types.TextContent(
+                type="text",
+                text=arguments["property_id"],
+            )
+        ]
+
+    return server
 
 
 class HttpServerConfigTest(unittest.TestCase):
@@ -51,3 +97,83 @@ class HttpServerConfigTest(unittest.TestCase):
     def test_rejects_invalid_port_environment_variable(self):
         with self.assertRaises(SystemExit):
             http_server.parse_http_config([], {"PORT": "not-a-port"})
+
+
+class HttpApplicationTest(unittest.TestCase):
+    def test_healthz_does_not_resolve_google_credentials(self):
+        app = http_server.create_http_app()
+        with mock.patch(
+            "analytics_mcp.tools.client._get_credentials"
+        ) as credentials:
+            with TestClient(app) as client:
+                response = client.get("/healthz")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.text, "ok")
+        credentials.assert_not_called()
+
+    def test_custom_mcp_path_replaces_default_path(self):
+        app = http_server.create_http_app(path="/analytics")
+        with TestClient(app, follow_redirects=False) as client:
+            response = client.get("/mcp")
+        self.assertEqual(response.status_code, 404)
+
+    def test_lifespan_starts_and_stops_session_manager(self):
+        events = []
+
+        @contextlib.asynccontextmanager
+        async def fake_run(_manager):
+            events.append("start")
+            try:
+                yield
+            finally:
+                events.append("stop")
+
+        with mock.patch.object(
+            http_server.StreamableHTTPSessionManager,
+            "run",
+            new=fake_run,
+        ):
+            app = http_server.create_http_app()
+            with TestClient(app):
+                self.assertEqual(events, ["start"])
+
+        self.assertEqual(events, ["start", "stop"])
+
+
+class StreamableHttpProtocolTest(unittest.IsolatedAsyncioTestCase):
+    async def test_initializes_lists_and_calls_tool(self):
+        app = http_server.create_http_app(
+            mcp_server=create_test_mcp_server()
+        )
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+                follow_redirects=True,
+            ) as http_client:
+                async with streamable_http_client(
+                    "http://testserver/mcp",
+                    http_client=http_client,
+                ) as (read_stream, write_stream, get_session_id):
+                    async with ClientSession(
+                        read_stream, write_stream
+                    ) as session:
+                        initialized = await session.initialize()
+                        tools = await session.list_tools()
+                        result = await session.call_tool(
+                            "echo_property",
+                            {"property_id": "123456"},
+                        )
+
+        self.assertEqual(
+            initialized.serverInfo.name,
+            "test-analytics-mcp",
+        )
+        self.assertEqual(
+            [tool.name for tool in tools.tools],
+            ["echo_property"],
+        )
+        self.assertFalse(result.isError)
+        self.assertEqual(result.content[0].text, "123456")
+        self.assertIsNone(get_session_id())
