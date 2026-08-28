@@ -1,0 +1,100 @@
+# Copyright 2025 Google LLC All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""OAuth resource-server configuration for Google Analytics MCP."""
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import Enum
+from urllib.parse import urlparse, urlunparse
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+class AuthMode(str, Enum):
+    """Supported HTTP authentication modes."""
+
+    NONE = "none"
+    AUTH0 = "auth0"
+
+
+@dataclass(frozen=True)
+class AuthConfig:
+    """OAuth resource-server configuration."""
+
+    mode: AuthMode
+    issuer: str | None = None
+    resource: str | None = None
+    required_scope: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        """Whether OAuth protection is enabled."""
+        return self.mode is AuthMode.AUTH0
+
+
+def _required(environ: Mapping[str, str], name: str) -> str:
+    value = environ.get(name, "").strip()
+    if not value:
+        raise ValueError(f"{name} is required when MCP_AUTH_MODE=auth0")
+    return value
+
+
+def _normalize_url(value: str, name: str, *, issuer: bool) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{name} must be an absolute HTTP(S) URL")
+    if parsed.query or parsed.fragment:
+        raise ValueError(f"{name} must not contain query or fragment")
+    if parsed.scheme != "https" and parsed.hostname not in _LOCAL_HOSTS:
+        raise ValueError(f"{name} must use HTTPS outside localhost")
+
+    path = parsed.path
+    if issuer:
+        path = path.rstrip("/") + "/"
+    elif path != "/":
+        path = path.rstrip("/")
+
+    return urlunparse(parsed._replace(path=path))
+
+
+def parse_auth_config(environ: Mapping[str, str]) -> AuthConfig:
+    """Parse OAuth configuration from environment values."""
+    mode_value = environ.get("MCP_AUTH_MODE", "none").strip().lower()
+    try:
+        mode = AuthMode(mode_value)
+    except ValueError as exc:
+        raise ValueError(f"invalid MCP_AUTH_MODE: {mode_value}") from exc
+
+    if mode is AuthMode.NONE:
+        return AuthConfig(mode=mode)
+
+    issuer = _normalize_url(
+        _required(environ, "MCP_AUTH_ISSUER"),
+        "MCP_AUTH_ISSUER",
+        issuer=True,
+    )
+    resource = _normalize_url(
+        _required(environ, "MCP_AUTH_RESOURCE"),
+        "MCP_AUTH_RESOURCE",
+        issuer=False,
+    )
+    required_scope = _required(environ, "MCP_AUTH_REQUIRED_SCOPE")
+
+    return AuthConfig(
+        mode=mode,
+        issuer=issuer,
+        resource=resource,
+        required_scope=required_scope,
+    )
