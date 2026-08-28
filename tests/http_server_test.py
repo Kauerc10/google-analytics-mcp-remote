@@ -22,10 +22,29 @@ import httpx
 from mcp import types as mcp_types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.server.auth.provider import AccessToken
 from mcp.server.lowlevel import Server
 from starlette.testclient import TestClient
 
-from analytics_mcp import http_server
+from analytics_mcp import auth, http_server
+
+
+AUTH_CONFIG = auth.AuthConfig(
+    mode=auth.AuthMode.AUTH0,
+    issuer="https://example.us.auth0.com/",
+    resource="https://analytics.example.com/mcp",
+    required_scope="analytics:read",
+)
+
+
+class _StaticTokenVerifier:
+    def __init__(self, access_token):
+        self.access_token = access_token
+        self.calls = []
+
+    async def verify_token(self, token):
+        self.calls.append(token)
+        return self.access_token
 
 
 def create_test_mcp_server() -> Server:
@@ -171,6 +190,128 @@ class HttpApplicationTest(unittest.TestCase):
                 self.assertEqual(events, ["start"])
 
         self.assertEqual(events, ["start", "stop"])
+
+
+class OAuthHttpApplicationTest(unittest.TestCase):
+    def test_healthz_stays_public_when_oauth_enabled(self):
+        verifier = _StaticTokenVerifier(None)
+        app = http_server.create_http_app(
+            auth_config=AUTH_CONFIG,
+            token_verifier=verifier,
+        )
+        with TestClient(app) as client:
+            response = client.get("/healthz")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.text, "ok")
+        self.assertEqual(verifier.calls, [])
+
+    def test_oauth_metadata_reports_resource_issuer_and_scope(self):
+        app = http_server.create_http_app(
+            auth_config=AUTH_CONFIG,
+            token_verifier=_StaticTokenVerifier(None),
+        )
+        with TestClient(app) as client:
+            response = client.get(
+                "/.well-known/oauth-protected-resource/mcp"
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            body["resource"],
+            "https://analytics.example.com/mcp",
+        )
+        self.assertEqual(
+            body["authorization_servers"],
+            ["https://example.us.auth0.com/"],
+        )
+        self.assertEqual(body["scopes_supported"], ["analytics:read"])
+
+    def test_mcp_without_token_returns_401(self):
+        app = http_server.create_http_app(
+            auth_config=AUTH_CONFIG,
+            token_verifier=_StaticTokenVerifier(None),
+        )
+        with TestClient(app, follow_redirects=False) as client:
+            response = client.post("/mcp")
+        self.assertEqual(response.status_code, 401)
+
+    def test_401_challenge_includes_resource_metadata(self):
+        app = http_server.create_http_app(
+            auth_config=AUTH_CONFIG,
+            token_verifier=_StaticTokenVerifier(None),
+        )
+        with TestClient(app, follow_redirects=False) as client:
+            response = client.post("/mcp")
+        challenge = response.headers["www-authenticate"]
+        self.assertIn("Bearer", challenge)
+        self.assertIn(
+            "resource_metadata=",
+            challenge,
+        )
+        self.assertIn(
+            "/.well-known/oauth-protected-resource/mcp",
+            challenge,
+        )
+
+    def test_invalid_token_returns_401(self):
+        verifier = _StaticTokenVerifier(None)
+        app = http_server.create_http_app(
+            auth_config=AUTH_CONFIG,
+            token_verifier=verifier,
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/mcp",
+                headers={"Authorization": "Bearer invalid-token"},
+            )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(verifier.calls, ["invalid-token"])
+
+    def test_valid_token_without_required_scope_returns_403(self):
+        access_token = AccessToken(
+            token="test-token",
+            client_id="auth0|test-user",
+            scopes=["openid"],
+            expires_at=None,
+            resource="https://analytics.example.com/mcp",
+        )
+        app = http_server.create_http_app(
+            auth_config=AUTH_CONFIG,
+            token_verifier=_StaticTokenVerifier(access_token),
+        )
+        with TestClient(app) as client:
+            response = client.post(
+                "/mcp",
+                headers={"Authorization": "Bearer test-token"},
+            )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"], "insufficient_scope")
+
+    def test_auth_disabled_does_not_publish_metadata(self):
+        app = http_server.create_http_app()
+        with TestClient(app) as client:
+            response = client.get(
+                "/.well-known/oauth-protected-resource/mcp"
+            )
+        self.assertEqual(response.status_code, 404)
+
+    def test_oauth_mcp_path_does_not_redirect(self):
+        app = http_server.create_http_app(
+            auth_config=AUTH_CONFIG,
+            token_verifier=_StaticTokenVerifier(None),
+        )
+        with TestClient(app, follow_redirects=False) as client:
+            response = client.post("/mcp")
+        self.assertEqual(response.status_code, 401)
+        self.assertNotEqual(response.status_code, 307)
+
+    def test_resource_path_must_match_mcp_path(self):
+        with self.assertRaisesRegex(ValueError, "resource path"):
+            http_server.create_http_app(
+                path="/analytics",
+                auth_config=AUTH_CONFIG,
+                token_verifier=_StaticTokenVerifier(None),
+            )
 
 
 class StreamableHttpProtocolTest(unittest.IsolatedAsyncioTestCase):
