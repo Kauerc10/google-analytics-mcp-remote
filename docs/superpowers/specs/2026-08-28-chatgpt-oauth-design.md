@@ -39,15 +39,15 @@ render login pages, store authorization codes, or implement `/authorize` or
 - Publish RFC 9728 Protected Resource Metadata for OAuth discovery.
 - Validate Auth0 JWT access tokens locally.
 - Require a single least-privilege scope: `analytics:read`.
-- Validate issuer, audience/resource, signature, expiry, and required scope.
+- Validate issuer, audience/resource, signature, and token lifetime.
+- Enforce the required scope through the MCP SDK authorization gate.
 - Preserve the existing stateless Streamable HTTP behavior and tool schemas.
 - Preserve the existing stdio entrypoints.
-- Preserve the existing unauthenticated HTTP behavior when OAuth is explicitly
-  disabled.
+- Preserve existing HTTP behavior when OAuth is explicitly disabled.
 - Fail closed when OAuth is enabled but misconfigured.
 - Remain compatible with the current lower bound `mcp>=1.24.0,<2`.
-- Deploy to Cloud Run in a way that ChatGPT can reach the OAuth discovery and
-  MCP endpoints without requiring a Google Cloud IAM identity token.
+- Deploy to Cloud Run so ChatGPT can reach OAuth discovery and `/mcp` without a
+  Google Cloud IAM identity token after application OAuth is verified.
 
 ## Non-goals
 
@@ -64,8 +64,6 @@ render login pages, store authorization codes, or implement `/authorize` or
 - Redis, database-backed sessions, sticky sessions, or an OAuth session store.
 
 ## Branch strategy
-
-The branch graph is intentionally layered:
 
 ```text
 main
@@ -84,15 +82,14 @@ deployment testing.
 ```text
 ChatGPT Developer Mode
         |
-        | OAuth 2.x authorization flow
+        | OAuth authorization flow + PKCE
         | resource=<public MCP URL>
         v
 Auth0 Authorization Server
         |
         | signed JWT access token
-        | scope=analytics:read
         v
-Google Analytics MCP
+Google Analytics MCP Resource Server
   - /healthz                                    public
   - /.well-known/oauth-protected-resource/mcp  public
   - /mcp                                       protected
@@ -125,10 +122,10 @@ The same exact value is used for:
 - RFC 9728 Protected Resource Metadata `resource`;
 - access-token audience validation.
 
-The implementation must not silently normalize this value into a different
-origin or path. Configuration should normalize only trivial trailing-slash
-ambiguity and should reject malformed or non-HTTPS production resource URLs.
-Localhost HTTP is allowed only in tests and local development.
+The implementation must not silently convert this value to a different origin
+or path. It may normalize only trivial trailing-slash ambiguity. Production
+resource URLs must use HTTPS. Localhost HTTP is allowed only for tests and local
+development.
 
 ## Auth0 tenant design
 
@@ -156,46 +153,42 @@ Required permission/scope:
 analytics:read
 ```
 
-Enable the Auth0 Resource Parameter Compatibility Profile so OAuth clients that
-follow RFC 8707 and send `resource=` receive a token for the intended MCP
-resource rather than falling back to an unrelated audience.
+Enable the Auth0 Resource Parameter Compatibility Profile so clients following
+RFC 8707 and sending `resource=` receive a token for the intended MCP resource.
 
 ### Login population
 
-This integration is initially private. The Auth0 tenant must not permit
-arbitrary public account creation for the MCP test.
+This integration is initially private. The tenant must not permit arbitrary
+public account creation for the MCP test.
 
 For the initial rollout:
 
 1. create the intended test user in Auth0;
 2. disable public sign-ups for the database connection, or otherwise restrict
    tenant login to explicitly approved identities;
-3. do not rely on obscurity of the Cloud Run URL as an access control.
+3. do not use obscurity of the Cloud Run URL as access control.
 
-An optional subject allowlist may be added later if operational testing shows a
-need for defense in depth, but it is not required for the first implementation
-because the tenant itself is private and the `analytics:read` scope is already
-mandatory.
+A subject allowlist can be added later if operational testing shows a concrete
+need. It is not part of the first implementation.
 
 ### Client registration
 
 The MCP server does not implement client registration endpoints.
 
 Auth0 remains authoritative for Authorization Server metadata and client
-registration. The initial ChatGPT integration may use whichever registration
-path the current Auth0/ChatGPT flow supports, including Auth0's current MCP
-client-registration capabilities or manual client configuration if necessary.
+registration. The ChatGPT integration may use whichever registration path the
+current Auth0/ChatGPT flow supports, including Auth0 MCP client-registration
+features or manual client configuration when necessary.
 
-The implementation must not depend on DCR-specific or CIMD-specific behavior.
-Those are concerns between ChatGPT and Auth0, not between ChatGPT and the MCP
-Resource Server.
+The Resource Server implementation does not depend on DCR-specific or
+CIMD-specific behavior. Those concerns are between ChatGPT and Auth0.
 
 ### Refresh tokens
 
-Auth0 should support the refresh-token behavior required by the client. Where
-the current ChatGPT OAuth flow requests `offline_access`, Auth0 should allow it.
-The MCP Resource Server never receives or stores a refresh token; it sees only
-Bearer access tokens presented to `/mcp`.
+Auth0 should support the refresh-token behavior required by ChatGPT. Where the
+client requests `offline_access`, Auth0 should allow it. The MCP Resource Server
+never receives or stores refresh tokens; it sees only Bearer access tokens sent
+to `/mcp`.
 
 ## Server configuration
 
@@ -208,33 +201,30 @@ MCP_AUTH_RESOURCE=https://<service>.run.app/mcp
 MCP_AUTH_REQUIRED_SCOPE=analytics:read
 ```
 
-Optional implementation-only configuration may include a JWKS cache lifetime,
-but the initial public configuration surface should stay minimal.
+The initial public configuration surface stays deliberately small.
 
-### Mode behavior
+### `MCP_AUTH_MODE=none`
 
-`MCP_AUTH_MODE=none`
-
-- preserves the current HTTP behavior;
+- preserves current HTTP behavior;
 - `/mcp` is not wrapped in Bearer authentication;
 - no OAuth metadata route is registered;
-- local tests and generic deployments remain compatible.
+- local and generic deployments remain compatible.
 
-`MCP_AUTH_MODE=auth0`
+### `MCP_AUTH_MODE=auth0`
 
 - requires issuer, resource, and required scope;
 - protects `/mcp`;
 - publishes Protected Resource Metadata;
 - validates Auth0-issued JWTs;
-- fails application startup if required configuration is missing or malformed.
+- fails startup if required configuration is missing or malformed.
 
-Unknown values fail startup.
+Unknown auth modes fail startup.
 
 ## Code boundaries
 
 ### `analytics_mcp/auth.py`
 
-New focused module responsible for OAuth Resource Server concerns.
+New focused module for OAuth Resource Server concerns.
 
 Planned units:
 
@@ -245,33 +235,34 @@ Planned units:
 
 - `Auth0TokenVerifier`
   - implements `mcp.server.auth.provider.TokenVerifier`;
-  - validates JWT signature using Auth0 JWKS;
+  - validates JWT signature against Auth0 JWKS;
   - accepts only RS256;
   - validates exact issuer;
   - validates audience against the configured MCP resource;
   - validates token lifetime;
-  - extracts OAuth scopes;
-  - returns the SDK `AccessToken` model when valid;
+  - extracts OAuth scopes without enforcing them itself;
+  - returns the SDK `AccessToken` model when identity validation succeeds;
   - returns `None` for authentication failures.
 
-- helper(s) for building the SDK `AuthSettings` and protected-resource metadata
+- helper(s) for building SDK `AuthSettings` and protected-resource metadata
   configuration without duplicating protocol logic.
 
-The verifier should use a mature JWT library rather than custom cryptography.
-`PyJWT` with its JWK/JWKS support is the preferred implementation dependency
-unless implementation testing identifies a concrete incompatibility.
+The verifier uses a mature JWT library rather than custom cryptography. `PyJWT`
+with JWK/JWKS support is preferred unless implementation testing identifies a
+concrete incompatibility.
 
 JWKS lookups must be cached by the JWT/JWKS client so normal MCP calls do not
-perform an Auth0 network request on every tool invocation.
+perform an Auth0 network request on every tool invocation. Any synchronous JWKS
+work must not block the async server event loop.
 
 ### `analytics_mcp/http_server.py`
 
 Remains responsible for HTTP transport composition.
 
-When OAuth is disabled, it retains the current route and lifecycle behavior.
+When OAuth is disabled, current route and lifecycle behavior remains unchanged.
 
-When OAuth is enabled, it composes the existing exact `/mcp` ASGI endpoint with
-the MCP SDK's authentication building blocks:
+When OAuth is enabled, compose the existing exact `/mcp` ASGI endpoint with MCP
+SDK authentication components available in the supported v1.x SDK, including:
 
 - `BearerAuthBackend`;
 - Starlette `AuthenticationMiddleware`;
@@ -280,44 +271,47 @@ the MCP SDK's authentication building blocks:
 - `create_protected_resource_routes`;
 - `build_resource_metadata_url`.
 
-The project should use the SDK-provided RFC 9728 behavior instead of hand-writing
-401 bodies or Protected Resource Metadata JSON.
+Use SDK-provided RFC 9728 behavior instead of hand-writing 401 bodies or
+Protected Resource Metadata JSON.
 
-The exact `/mcp` route must remain a `Route`, not a Starlette `Mount`, so the
-previously fixed `/mcp` -> `/mcp/` redirect regression cannot return.
+The exact `/mcp` endpoint remains a Starlette `Route`, not a `Mount`, so the
+previously fixed `/mcp` to `/mcp/` redirect regression cannot return.
 
 ### Tests
 
-Auth-specific tests should live in a separate focused test module, for example:
+Auth-specific tests live in a focused module such as:
 
 ```text
 tests/auth_test.py
 ```
 
-Existing `tests/http_server_test.py` remains the regression suite for transport
-behavior and gains only integration assertions that are specific to HTTP route
-composition.
+Existing `tests/http_server_test.py` remains the transport regression suite and
+gains only route-composition integration assertions.
 
 ## JWT validation policy
 
-A token is accepted only when all of the following are true:
+The verifier accepts an identity only when all of the following are true:
 
-- the Bearer token is syntactically valid;
+- the Bearer value is a syntactically valid JWT;
 - the JWT is signed by a key published by the configured Auth0 tenant;
 - the signing algorithm is RS256;
 - `iss` exactly matches `MCP_AUTH_ISSUER`;
 - `aud` contains or equals `MCP_AUTH_RESOURCE`;
 - the token is not expired;
-- any time-based validity enforced by the JWT library is satisfied;
-- the token contains `analytics:read` in its OAuth `scope` claim.
+- other time validity enforced by the JWT library succeeds;
+- required identity claims needed to construct the SDK `AccessToken` are
+  present.
 
-A token that fails cryptographic or identity validation is treated as invalid and
-results in the SDK's 401 path.
+The verifier extracts the OAuth `scope` claim and returns those scopes with the
+SDK `AccessToken`. It does **not** reject an otherwise valid token merely because
+`analytics:read` is absent. `RequireAuthMiddleware` is responsible for scope
+authorization so that a valid token with insufficient permissions returns 403,
+not 401.
 
-A valid token missing the required scope reaches the SDK's authorization gate
-and returns 403 `insufficient_scope`.
+A cryptographically or semantically invalid token returns `None` from the
+verifier and follows the SDK 401 path.
 
-The JWT verifier must not log raw access tokens.
+Raw access tokens must never be logged.
 
 ## HTTP behavior
 
@@ -367,7 +361,7 @@ Expected metadata includes:
 }
 ```
 
-The route should be produced by the MCP SDK's RFC 9728 helpers.
+The route is produced by MCP SDK RFC 9728 helpers.
 
 ### Unauthenticated MCP request
 
@@ -376,27 +370,27 @@ POST /mcp
 ```
 
 without `Authorization` returns 401 and a `WWW-Authenticate: Bearer` challenge
-that points at the resource metadata URL.
+pointing at the Protected Resource Metadata URL.
 
 ### Invalid token
 
-Malformed, forged, expired, wrong-issuer, or wrong-audience token returns 401.
+Malformed, forged, expired, wrong-issuer, or wrong-audience tokens return 401.
 
 ### Insufficient scope
 
-A valid token without `analytics:read` returns 403 `insufficient_scope`.
+A cryptographically valid token without `analytics:read` returns 403
+`insufficient_scope`.
 
 ### Authorized MCP request
 
-A valid Auth0 token with `analytics:read` proceeds into the existing
-Streamable HTTP session manager and preserves the current stateless MCP
-semantics.
+A valid Auth0 token containing `analytics:read` proceeds into the existing
+Streamable HTTP session manager and preserves stateless MCP semantics.
 
 ## Google Analytics identity model
 
 OAuth protects access to the MCP endpoint only.
 
-The server's Google Analytics identity remains unchanged:
+The downstream Google identity remains:
 
 ```text
 Cloud Run service identity / ADC
@@ -412,31 +406,50 @@ The Auth0 access token must never be forwarded to Google APIs.
 
 ## Cloud Run deployment model
 
-The current upstream-oriented guide protects Cloud Run with Google Cloud IAM.
-That model cannot be used unchanged for this ChatGPT OAuth integration because
-ChatGPT must reach both OAuth discovery and `/mcp` without first possessing a
+The upstream-oriented remote-server guide protects Cloud Run with Google Cloud
+IAM. That cannot remain the final access layer for the ChatGPT integration,
+because ChatGPT must eventually reach OAuth discovery and `/mcp` without a
 Google-signed Cloud Run identity token.
 
-For the OAuth integration branch:
+The deployment is therefore bootstrapped in two phases to avoid any interval
+where an unprotected MCP endpoint is publicly reachable.
 
-- Cloud Run is internet reachable at the platform layer;
-- `/healthz` and RFC 9728 metadata are intentionally public;
-- `/mcp` is protected by application-layer OAuth;
-- the service still runs under a dedicated Google service account for ADC;
-- the service account receives only the Google Analytics property access it
-  needs;
-- no Google service-account key is stored in the image or repository.
+### Phase 1: private bootstrap
 
-Using Cloud Run's `--allow-unauthenticated` for this deployment means the
-platform permits requests to reach the application. It does **not** mean MCP
-access is unauthenticated; `/mcp` remains closed by the Auth0 Bearer gate.
+1. Deploy the OAuth branch to a dedicated Cloud Run service with
+   `--no-allow-unauthenticated`.
+2. Obtain the service's stable public URL while Google Cloud IAM still protects
+   all incoming requests.
+3. Configure the Auth0 API identifier to the exact `<service-url>/mcp` value.
+4. Configure `MCP_AUTH_MODE=auth0`, issuer, resource, and scope on Cloud Run.
+5. Redeploy while the Cloud Run IAM gate remains enabled.
+6. Use an authenticated operator path such as the Cloud Run proxy to verify the
+   application itself returns:
+   - public-app `/healthz` behavior;
+   - RFC 9728 metadata;
+   - 401 from `/mcp` without an Auth0 token;
+   - successful MCP initialization with a valid Auth0 token.
 
-OAuth-enabled Cloud Run deployment must not occur until tests demonstrate that
-missing or malformed auth configuration fails closed.
+### Phase 2: ChatGPT reachability
+
+Only after Phase 1 succeeds:
+
+1. change the Cloud Run invoker policy so the Internet can reach the
+   application;
+2. verify `/mcp` still returns 401 without an Auth0 token from an ordinary
+   unauthenticated network request;
+3. verify metadata remains public;
+4. connect ChatGPT Developer Mode through OAuth.
+
+At this point Cloud Run permits requests to reach the application, but the MCP
+resource itself remains authenticated by Auth0.
+
+The service continues to run under a dedicated Google service account for ADC.
+No Google service-account key is copied into the repository or image.
 
 ## Error handling
 
-Startup errors:
+Startup failures:
 
 - unknown `MCP_AUTH_MODE` -> fail startup;
 - Auth0 mode with missing issuer -> fail startup;
@@ -444,7 +457,7 @@ Startup errors:
 - Auth0 mode with missing scope -> fail startup;
 - malformed issuer/resource URL -> fail startup.
 
-Request errors:
+Request failures:
 
 - missing token -> 401;
 - malformed token -> 401;
@@ -456,8 +469,7 @@ Request errors:
 - valid token without required scope -> 403;
 - Auth0/JWKS temporary failure -> fail closed rather than bypass auth.
 
-The application should log high-level validation failures without logging the
-Bearer token itself.
+Log high-level validation failure categories only. Never log the Bearer token.
 
 ## TDD strategy
 
@@ -474,7 +486,7 @@ Implementation follows RED -> GREEN -> REFACTOR.
 
 ### Token verifier tests
 
-Use generated test RSA keys and a local/mock JWKS response. No unit test should
+Use generated test RSA keys and a local/mock JWKS response. Unit tests must not
 require the real Auth0 tenant.
 
 1. valid RS256 JWT is accepted;
@@ -483,25 +495,27 @@ require the real Auth0 tenant.
 4. expired token is rejected;
 5. wrong issuer is rejected;
 6. wrong audience is rejected;
-7. scope extraction is correct;
-8. token without the required identity claims is rejected;
-9. verifier does not require a network call after a cached key is available,
-   where this can be asserted reliably without coupling to library internals.
+7. OAuth scopes are extracted correctly;
+8. valid token without `analytics:read` remains an authenticated identity so the
+   HTTP authorization layer can return 403;
+9. token without required identity claims is rejected;
+10. repeated verification can use cached JWKS material where this can be tested
+    without coupling to private library internals.
 
 ### HTTP integration tests
 
 1. `/healthz` remains public;
 2. `/healthz` does not touch Auth0 or Google credentials;
-3. OAuth metadata route is present only when auth is enabled;
-4. metadata reports the exact resource, issuer, and required scope;
+3. OAuth metadata route exists only when auth is enabled;
+4. metadata reports exact resource, issuer, and required scope;
 5. `/mcp` without token returns 401;
 6. 401 challenge includes `resource_metadata`;
 7. invalid token returns 401;
 8. valid token without scope returns 403;
 9. valid token with scope reaches the MCP protocol;
-10. authorized MCP `initialize`, `list_tools`, and `call_tool` still work;
+10. authorized MCP `initialize`, `list_tools`, and `call_tool` work;
 11. stateless operation still returns no MCP session ID;
-12. canonical `/mcp` still does not redirect;
+12. canonical `/mcp` does not redirect;
 13. auth disabled preserves the existing protocol suite unchanged.
 
 ### Compatibility verification
@@ -510,7 +524,7 @@ Before completion:
 
 - run `nox -s lint`;
 - run tests on Python 3.10, 3.11, 3.12, and 3.13 where available;
-- run the full transport/auth suite with the normal dependency resolution;
+- run the full transport/auth suite with normal dependency resolution;
 - repeat the relevant suite with `mcp==1.24.0` to prove the declared lower bound;
 - build wheel and sdist;
 - install the wheel in a clean environment;
@@ -518,20 +532,18 @@ Before completion:
 - smoke-test `/healthz`, OAuth discovery, unauthenticated `/mcp`, and authorized
   MCP initialization inside the container.
 
-## Auth0 integration verification
+## Hosted Auth0 integration verification
 
-After local tests are green, create the dedicated Auth0 tenant and configure the
-API/resource server.
+After local tests are green:
 
-The hosted verification sequence is:
-
-1. deploy the OAuth branch to a dedicated Cloud Run service;
-2. set the Auth0 API identifier to the exact deployed `/mcp` URL;
-3. configure the Cloud Run environment with issuer, resource, and scope;
-4. confirm public `/healthz`;
-5. confirm RFC 9728 metadata from the deployed service;
-6. confirm unauthenticated `/mcp` returns 401;
-7. obtain a real Auth0 access token and confirm authorized MCP initialization;
+1. create the dedicated Auth0 tenant;
+2. restrict its user population;
+3. enable the Resource Parameter Compatibility Profile;
+4. perform the private Cloud Run bootstrap described above;
+5. configure the Auth0 API with the exact deployed resource URL;
+6. obtain a real Auth0 access token and verify the protected MCP endpoint;
+7. expose the application at the Cloud Run platform layer only after the Auth0
+   gate has been demonstrated;
 8. connect the URL in ChatGPT Developer Mode with OAuth;
 9. complete Auth0 Universal Login;
 10. verify ChatGPT discovers the Google Analytics tools;
@@ -545,32 +557,31 @@ No upstream PR is opened as part of this branch.
 - The transport branch remains unchanged.
 - OAuth credentials and tokens never enter git.
 - Access tokens are never logged.
-- JWT algorithms are allowlisted, never inferred from untrusted token headers.
+- JWT algorithms are allowlisted, never inferred from untrusted headers.
 - JWKS keys are trusted only from the configured Auth0 issuer.
 - Audience is bound to the exact MCP resource.
-- `analytics:read` is mandatory in Auth0 mode.
-- `/mcp` fails closed when authorization cannot be established.
+- `analytics:read` is enforced by the MCP authorization gate.
+- `/mcp` fails closed when authentication cannot be established.
 - `/healthz` reveals only process liveness.
 - Google Analytics remains read-only.
 - Auth0 tokens are never reused as Google tokens.
-- Public Cloud Run reachability is acceptable only after the application OAuth
-  gate is verified.
+- Cloud Run becomes publicly reachable only after the application OAuth gate is
+  verified while still behind IAM.
 
 ## Rollout and rollback
 
 The OAuth feature is opt-in and branch-isolated.
 
-Rollback options are intentionally simple:
+Rollback options:
 
-- disable or delete the dedicated Cloud Run OAuth test service;
+- restore the Cloud Run IAM gate or delete the dedicated OAuth test service;
 - disable the Auth0 application/API;
 - leave `feat/streamable-http-transport` untouched;
-- no migration or persistent data rollback is required.
+- no migration or persistent-data rollback is required.
 
 ## Success criteria
 
-The feature is complete when all of the following are demonstrated with fresh
-verification output:
+The feature is complete only when fresh verification demonstrates:
 
 - configuration fails closed;
 - JWT validation is cryptographically correct;
@@ -579,9 +590,9 @@ verification output:
 - insufficient scope returns 403;
 - authorized Streamable HTTP works without sessions;
 - Python 3.10-3.13 tests pass where available;
-- the auth path is verified with `mcp==1.24.0`;
-- Docker smoke tests pass;
-- the hosted Auth0 + Cloud Run path works;
+- the auth path works with `mcp==1.24.0`;
+- packaging and Docker smoke tests pass;
+- hosted Auth0 + Cloud Run works;
 - ChatGPT Developer Mode completes OAuth and discovers the tools;
 - at least one real read-only Google Analytics tool call succeeds from ChatGPT.
 
@@ -589,7 +600,7 @@ verification output:
 
 - MCP Python SDK authorization guide:
   https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/run/authorization.md
-- MCP Python SDK v1.24.0 auth settings and middleware:
+- MCP Python SDK v1.24.0 authentication implementation:
   https://github.com/modelcontextprotocol/python-sdk/tree/v1.24.0/src/mcp/server/auth
 - MCP authorization specification:
   https://modelcontextprotocol.io/specification/latest/basic/authorization
