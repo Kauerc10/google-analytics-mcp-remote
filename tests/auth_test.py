@@ -94,3 +94,26 @@ class AuthConfigTest(unittest.TestCase):
             }
         )
         self.assertEqual(config.resource, "http://localhost:8000/mcp")
+
+
+class HttpAuthConfigIntegrationTest(unittest.TestCase):
+    def test_http_config_includes_disabled_auth_by_default(self):
+        from analytics_mcp import http_server
+
+        config = http_server.parse_http_config([], {})
+        self.assertEqual(config.auth.mode, auth.AuthMode.NONE)
+
+    def test_http_config_preserves_auth0_configuration(self):
+        from analytics_mcp import http_server
+
+        config = http_server.parse_http_config(
+            [],
+            {
+                "MCP_AUTH_MODE": "auth0",
+                "MCP_AUTH_ISSUER": "https://example.us.auth0.com/",
+                "MCP_AUTH_RESOURCE": "https://analytics.example.com/mcp",
+                "MCP_AUTH_REQUIRED_SCOPE": "analytics:read",
+            },
+        )
+        self.assertEqual(config.auth.mode, auth.AuthMode.AUTH0)
+        self.assertEqual(config.auth.required_scope, "analytics:read")
