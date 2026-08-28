@@ -23,6 +23,11 @@ from urllib.parse import urlparse, urlunparse
 
 import jwt
 from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.routes import (
+    build_resource_metadata_url,
+    create_protected_resource_routes,
+)
+from pydantic import AnyHttpUrl
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _LOGGER = logging.getLogger(__name__)
@@ -106,15 +111,41 @@ def parse_auth_config(environ: Mapping[str, str]) -> AuthConfig:
     )
 
 
+def _auth0_value(value: str | None, name: str) -> str:
+    if value is None:
+        raise ValueError(f"{name} is required in auth0 mode")
+    return value
+
+
+def resource_metadata_url(config: AuthConfig) -> AnyHttpUrl:
+    """Return the RFC 9728 metadata URL for the MCP resource."""
+    resource = AnyHttpUrl(_auth0_value(config.resource, "resource"))
+    return build_resource_metadata_url(resource)
+
+
+def protected_resource_routes(config: AuthConfig):
+    """Create RFC 9728 discovery routes for the MCP resource."""
+    resource = AnyHttpUrl(_auth0_value(config.resource, "resource"))
+    issuer = AnyHttpUrl(_auth0_value(config.issuer, "issuer"))
+    required_scope = _auth0_value(config.required_scope, "required_scope")
+    return create_protected_resource_routes(
+        resource_url=resource,
+        authorization_servers=[issuer],
+        scopes_supported=[required_scope],
+        resource_name="Google Analytics MCP",
+    )
+
+
 class Auth0TokenVerifier(TokenVerifier):
     """Validate Auth0-issued RS256 access tokens for the MCP resource."""
 
     def __init__(self, config: AuthConfig, jwks_client=None):
         if not config.enabled:
             raise ValueError("Auth0TokenVerifier requires auth0 mode")
+        issuer = _auth0_value(config.issuer, "issuer")
         self._config = config
         self._jwks_client = jwks_client or jwt.PyJWKClient(
-            f"{config.issuer}.well-known/jwks.json"
+            f"{issuer}.well-known/jwks.json"
         )
 
     async def verify_token(self, token: str) -> AccessToken | None:
@@ -132,7 +163,7 @@ class Auth0TokenVerifier(TokenVerifier):
                 issuer=self._config.issuer,
                 options={"require": ["iss", "aud", "sub", "exp"]},
             )
-        except (jwt.PyJWTError, jwt.PyJWKClientError) as exc:
+        except jwt.PyJWTError as exc:
             _LOGGER.debug(
                 "Rejected Auth0 access token: %s",
                 exc.__class__.__name__,
