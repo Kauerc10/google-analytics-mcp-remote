@@ -163,7 +163,10 @@ def create_http_app(
     routes = [Route("/healthz", healthz, methods=["GET"])]
 
     if auth_config.enabled:
-        resource = auth._auth0_value(auth_config.resource, "resource")
+        resource = auth_config.resource
+        required_scope = auth_config.required_scope
+        if resource is None or required_scope is None:
+            raise ValueError("OAuth configuration is incomplete")
         resource_path = urlparse(resource).path.rstrip("/") or "/"
         if resource_path != normalized_path:
             raise ValueError("OAuth resource path must match MCP path")
@@ -171,12 +174,7 @@ def create_http_app(
         verifier = token_verifier or auth.Auth0TokenVerifier(auth_config)
         protected_endpoint = RequireAuthMiddleware(
             mcp_endpoint,
-            required_scopes=[
-                auth._auth0_value(
-                    auth_config.required_scope,
-                    "required_scope",
-                )
-            ],
+            required_scopes=[required_scope],
             resource_metadata_url=auth.resource_metadata_url(auth_config),
         )
         protected_endpoint = AuthContextMiddleware(protected_endpoint)
