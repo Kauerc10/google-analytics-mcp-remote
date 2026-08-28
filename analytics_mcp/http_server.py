@@ -29,6 +29,7 @@ from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
+import analytics_mcp.auth as auth
 import analytics_mcp.coordinator as coordinator
 
 _LOCAL_BIND_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -41,6 +42,7 @@ class HttpServerConfig:
     host: str
     port: int
     path: str
+    auth: auth.AuthConfig
 
 
 class _McpEndpoint:
@@ -120,7 +122,12 @@ def parse_http_config(
     parser.add_argument("--port", type=_port, default=default_port)
     parser.add_argument("--path", type=_path, default="/mcp")
     args = parser.parse_args(argv)
-    return HttpServerConfig(args.host, args.port, args.path)
+    return HttpServerConfig(
+        args.host,
+        args.port,
+        args.path,
+        auth.parse_auth_config(env),
+    )
 
 
 def create_http_app(
