@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OAuth resource-server configuration for Google Analytics MCP."""
+"""OAuth resource-server support for Google Analytics MCP."""
 
+import asyncio
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from urllib.parse import urlparse, urlunparse
 
+import jwt
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_LOGGER = logging.getLogger(__name__)
 
 
 class AuthMode(str, Enum):
@@ -98,3 +104,56 @@ def parse_auth_config(environ: Mapping[str, str]) -> AuthConfig:
         resource=resource,
         required_scope=required_scope,
     )
+
+
+class Auth0TokenVerifier(TokenVerifier):
+    """Validate Auth0-issued RS256 access tokens for the MCP resource."""
+
+    def __init__(self, config: AuthConfig, jwks_client=None):
+        if not config.enabled:
+            raise ValueError("Auth0TokenVerifier requires auth0 mode")
+        self._config = config
+        self._jwks_client = jwks_client or jwt.PyJWKClient(
+            f"{config.issuer}.well-known/jwks.json"
+        )
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """Validate a Bearer token and return MCP access metadata."""
+        try:
+            signing_key = await asyncio.to_thread(
+                self._jwks_client.get_signing_key_from_jwt,
+                token,
+            )
+            claims = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=["RS256"],
+                audience=self._config.resource,
+                issuer=self._config.issuer,
+                options={"require": ["iss", "aud", "sub", "exp"]},
+            )
+        except (jwt.PyJWTError, jwt.PyJWKClientError) as exc:
+            _LOGGER.debug(
+                "Rejected Auth0 access token: %s",
+                exc.__class__.__name__,
+            )
+            return None
+
+        subject = claims.get("sub")
+        expiration = claims.get("exp")
+        if not isinstance(subject, str) or not subject:
+            _LOGGER.debug("Rejected Auth0 access token: invalid subject")
+            return None
+        if not isinstance(expiration, int) or isinstance(expiration, bool):
+            _LOGGER.debug("Rejected Auth0 access token: invalid expiry")
+            return None
+
+        scope_claim = claims.get("scope", "")
+        scopes = scope_claim.split() if isinstance(scope_claim, str) else []
+        return AccessToken(
+            token=token,
+            client_id=subject,
+            scopes=scopes,
+            expires_at=expiration,
+            resource=self._config.resource,
+        )
