@@ -19,11 +19,19 @@ import contextlib
 import os
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
+from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
+from mcp.server.auth.middleware.bearer_auth import (
+    BearerAuthBackend,
+    RequireAuthMiddleware,
+)
+from mcp.server.auth.provider import TokenVerifier
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
+from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route
@@ -134,9 +142,12 @@ def create_http_app(
     mcp_server: Server = coordinator.app,
     path: str = "/mcp",
     host: str = "127.0.0.1",
+    auth_config: auth.AuthConfig | None = None,
+    token_verifier: TokenVerifier | None = None,
 ) -> Starlette:
     """Create the ASGI application for Streamable HTTP."""
     normalized_path = _path(path)
+    auth_config = auth_config or auth.AuthConfig(auth.AuthMode.NONE)
     session_manager = StreamableHTTPSessionManager(
         app=mcp_server,
         event_store=None,
@@ -148,28 +159,57 @@ def create_http_app(
     async def healthz(_: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
 
+    mcp_endpoint = _McpEndpoint(session_manager)
+    routes = [Route("/healthz", healthz, methods=["GET"])]
+
+    if auth_config.enabled:
+        resource = auth._auth0_value(auth_config.resource, "resource")
+        resource_path = urlparse(resource).path.rstrip("/") or "/"
+        if resource_path != normalized_path:
+            raise ValueError("OAuth resource path must match MCP path")
+
+        verifier = token_verifier or auth.Auth0TokenVerifier(auth_config)
+        protected_endpoint = RequireAuthMiddleware(
+            mcp_endpoint,
+            required_scopes=[
+                auth._auth0_value(
+                    auth_config.required_scope,
+                    "required_scope",
+                )
+            ],
+            resource_metadata_url=auth.resource_metadata_url(auth_config),
+        )
+        protected_endpoint = AuthContextMiddleware(protected_endpoint)
+        mcp_endpoint = AuthenticationMiddleware(
+            protected_endpoint,
+            backend=BearerAuthBackend(verifier),
+        )
+        routes.extend(auth.protected_resource_routes(auth_config))
+
+    routes.append(
+        Route(
+            normalized_path,
+            endpoint=mcp_endpoint,
+            methods=["GET", "POST", "DELETE"],
+        )
+    )
+
     @contextlib.asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncIterator[None]:
         async with session_manager.run():
             yield
 
-    return Starlette(
-        routes=[
-            Route("/healthz", healthz, methods=["GET"]),
-            Route(
-                normalized_path,
-                endpoint=_McpEndpoint(session_manager),
-                methods=["GET", "POST", "DELETE"],
-            ),
-        ],
-        lifespan=lifespan,
-    )
+    return Starlette(routes=routes, lifespan=lifespan)
 
 
 def run_http_server(argv: Sequence[str] | None = None) -> None:
     """Run the Streamable HTTP server with Uvicorn."""
     config = parse_http_config(argv)
-    app = create_http_app(path=config.path, host=config.host)
+    app = create_http_app(
+        path=config.path,
+        host=config.host,
+        auth_config=config.auth,
+    )
 
     import uvicorn
 
