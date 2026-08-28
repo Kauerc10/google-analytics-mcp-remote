@@ -179,6 +179,10 @@ authenticated deployment or proxy layer. See
 [Remote server deployment](docs/remote-server.md) for Docker, Cloud Run, and
 security guidance.
 
+For experimental ChatGPT Developer Mode testing with Auth0 OAuth, see
+[ChatGPT OAuth integration](docs/chatgpt-oauth.md). That flow keeps the generic
+remote transport unchanged and protects only the hosted `/mcp` endpoint.
+
 ## Try it out 🥼
 
 Launch Gemini Code Assist or Gemini CLI and type `/mcp`. You should see
